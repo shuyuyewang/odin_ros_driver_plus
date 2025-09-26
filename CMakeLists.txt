@@ -217,6 +217,7 @@ elseif(ROS_VERSION STREQUAL "ROS2")
   find_package(std_msgs REQUIRED)
   find_package(sensor_msgs REQUIRED)
   find_package(nav_msgs REQUIRED)
+  find_package(geometry_msgs REQUIRED)
   find_package(cv_bridge REQUIRED)
   find_package(image_transport REQUIRED)
   find_package(pcl_conversions REQUIRED)
@@ -280,7 +281,7 @@ elseif(ROS_VERSION STREQUAL "ROS2")
     yaml-cpp
   )
   ament_target_dependencies(mapping_node
-    rclcpp sensor_msgs nav_msgs
+    rclcpp sensor_msgs nav_msgs geometry_msgs
     pcl_conversions std_srvs
   )
 
@@ -323,7 +324,7 @@ elseif(ROS_VERSION STREQUAL "ROS2")
 
   ament_export_targets(export_${PROJECT_NAME})
   ament_export_dependencies(
-    rclcpp std_msgs sensor_msgs nav_msgs
+    rclcpp std_msgs sensor_msgs nav_msgs geometry_msgs
     cv_bridge image_transport
     pcl_conversions message_filters
     std_srvs
