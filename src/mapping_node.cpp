@@ -1,550 +1,668 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
-#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-#include <geometry_msgs/msg/pose.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <std_srvs/srv/trigger.hpp>
-#include <pcl_conversions/pcl_conversions.h>
+#include <std_srvs/srv/set_bool.hpp>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
-#include <pcl/filters/filter.h>
+#include <pcl/registration/icp.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/filters/radius_outlier_removal.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/io/ply_io.h>
+#include <pcl/common/transforms.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl_conversions/pcl_conversions.h>
 
-#include <Eigen/Core>
+#include <Eigen/Dense>
 #include <Eigen/Geometry>
 
-#include <deque>
-#include <optional>
+#include <chrono>
 #include <mutex>
 #include <filesystem>
-#include <fstream>
-#include <sstream>
-#include <chrono>
-#include <iomanip>
 #include <cmath>
+#include <deque>
+#include <unordered_map>
+#include <thread>
+#include <atomic>
 
-// ------------------------------ MappingNode ------------------------------
-class MappingNode : public rclcpp::Node {
-public:
-  MappingNode() : Node("mapping_node") {
-    // === 参数 ===
-    input_topic_      = declare_parameter<std::string>("input_topic", "/odin1/cloud_render");
-    output_frame_     = declare_parameter<std::string>("output_frame", "map");
+using PointT = pcl::PointXYZ;
+using PointCloudT = pcl::PointCloud<PointT>;
 
-    // 预处理/滤波
-    leaf_size_        = declare_parameter<double>("leaf_size", 0.05);   // m
-    min_range_        = declare_parameter<double>("min_range", 0.30);   // m
-    max_range_        = declare_parameter<double>("max_range", 40.0);   // m
-    global_voxel_every_n_ = declare_parameter<int>("global_voxel_every_n", 3); // 每N帧做一次全局再体素
-
-    // 里程计/deskew
-    enable_deskew_    = declare_parameter<bool>("enable_deskew", false);
-    time_field_name_  = declare_parameter<std::string>("deskew_time_field", "time");
-    scan_period_      = declare_parameter<double>("scan_period", 0.1);
-    deskew_ref_end_   = declare_parameter<bool>("deskew_ref_is_end", true);
-
-    // 单位归一化
-    auto_unit_scale_  = declare_parameter<bool>("auto_unit_scale", true);
-    unit_scale_param_ = declare_parameter<double>("unit_scale", 1.0); // !=1优先
-
-    // 关键帧策略
-    kf_trans_thresh_  = declare_parameter<double>("keyframe_trans_thresh", 0.10); // m
-    kf_rot_deg_thresh_= declare_parameter<double>("keyframe_rot_deg_thresh", 6.0); // deg
-
-    // 保存
-    save_dir_         = declare_parameter<std::string>("save_dir", "mapping_maps");
-    save_format_      = declare_parameter<std::string>("save_format", "ply"); // pcd | ply
-    stamp_in_name_    = declare_parameter<bool>("stamp_in_filename", true);
-    save_traj_csv_    = declare_parameter<bool>("save_trajectory_csv", true);
-    save_period_sec_  = declare_parameter<double>("save_period", 0.0); // >0 开启定时保存
-
-    debug_log_        = declare_parameter<bool>("debug_log", false);
-
-    std::filesystem::create_directories(save_dir_);
-
-    // === ROS I/O ===
-    map_pub_  = create_publisher<sensor_msgs::msg::PointCloud2>("/mapping/accumulated_map", rclcpp::QoS(1).transient_local());
-    odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/mapping/odom", rclcpp::QoS(50));
-
-    cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-      input_topic_, rclcpp::SensorDataQoS(),
-      std::bind(&MappingNode::cloudCallback, this, std::placeholders::_1));
-
-    odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-      "/odin1/odometry", rclcpp::QoS(200),
-      std::bind(&MappingNode::odomCallback, this, std::placeholders::_1));
-
-    save_srv_ = create_service<std_srvs::srv::Trigger>(
-      "/mapping/save_map", std::bind(&MappingNode::saveService, this,
-                                     std::placeholders::_1, std::placeholders::_2));
-
-    if (save_period_sec_ > 1e-6) {
-      auto period = std::chrono::duration<double>(save_period_sec_);
-      timer_ = create_wall_timer(
-        std::chrono::duration_cast<std::chrono::milliseconds>(period),
-        std::bind(&MappingNode::onTimer, this));
-      RCLCPP_INFO(get_logger(), "Auto-save every %.3f s enabled.", save_period_sec_);
-    }
-
-    RCLCPP_INFO(get_logger(), "MappingNode (pure-odom) ready. sub=%s, odom=/odin1/odometry, frame=%s",
-                input_topic_.c_str(), output_frame_.c_str());
-  }
-
-private:
-  using PointT = pcl::PointXYZRGB;
-  using CloudT = pcl::PointCloud<PointT>;
-
-  struct TimedPose {
-    rclcpp::Time stamp;
-    Eigen::Matrix4f T; // odom->base
-  };
-  struct TrajEntry {
-    rclcpp::Time stamp;
-    Eigen::Vector3f t;
-    Eigen::Quaternionf q;
-  };
-
-  // --------- 工具 ---------
-  static inline Eigen::Matrix4f poseMsgToMat4(const geometry_msgs::msg::Pose &p){
-    Eigen::Quaternionf q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
-    q.normalize();
-    Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
-    T.block<3,3>(0,0) = q.toRotationMatrix();
-    T(0,3) = static_cast<float>(p.position.x);
-    T(1,3) = static_cast<float>(p.position.y);
-    T(2,3) = static_cast<float>(p.position.z);
-    return T;
-  }
-  static inline Eigen::Matrix4f interpolateSE3(const Eigen::Matrix4f& A, const Eigen::Matrix4f& B, double alpha){
-    alpha = std::clamp(alpha, 0.0, 1.0);
-    Eigen::Quaternionf qA(Eigen::Matrix3f(A.block<3,3>(0,0)));
-    Eigen::Quaternionf qB(Eigen::Matrix3f(B.block<3,3>(0,0)));
-    Eigen::Quaternionf q = qA.slerp(static_cast<float>(alpha), qB).normalized();
-    Eigen::Vector3f t = (1.0f - static_cast<float>(alpha)) * A.block<3,1>(0,3)
-                      + static_cast<float>(alpha) * B.block<3,1>(0,3);
-    Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
-    T.block<3,3>(0,0) = q.toRotationMatrix();
-    T.block<3,1>(0,3) = t;
-    return T;
-  }
-  static double median(std::vector<double>& v){
-    if (v.empty()) return 0.0;
-    size_t n=v.size()/2;
-    std::nth_element(v.begin(), v.begin()+n, v.end());
-    double m=v[n];
-    if (v.size()%2==0){
-      std::nth_element(v.begin(), v.begin()+n-1, v.end());
-      m=0.5*(m+v[n-1]);
-    }
-    return m;
-  }
-
-  // 读取 cloud：如果无 rgb 则先转 XYZ 再补默认灰色
-  bool msgToCloudXYZRGB(const sensor_msgs::msg::PointCloud2& msg, CloudT::Ptr& out, bool& had_rgb) {
-    had_rgb = false;
-    for (const auto& f : msg.fields) if (f.name=="rgb" || f.name=="rgba") { had_rgb=true; break; }
-
-    if (had_rgb) {
-      try { out.reset(new CloudT()); pcl::fromROSMsg(msg, *out); return true; }
-      catch (...) { return false; }
-    } else {
-      pcl::PointCloud<pcl::PointXYZ>::Ptr xyz(new pcl::PointCloud<pcl::PointXYZ>());
-      try { pcl::fromROSMsg(msg, *xyz); } catch(...) { return false; }
-      out.reset(new CloudT()); out->reserve(xyz->size());
-      const uint8_t r=200,g=200,b=200;
-      const uint32_t rgb = (uint32_t(r)<<16) | (uint32_t(g)<<8) | uint32_t(b);
-      float rgb_f; std::memcpy(&rgb_f, &rgb, sizeof(float));
-      for (auto &p : *xyz) { PointT q; q.x=p.x; q.y=p.y; q.z=p.z; q.rgb=rgb_f; out->push_back(q); }
-      return true;
-    }
-  }
-
-  // 自动单位：中位半径>100 ≈ 毫米制 → ×0.001
-  double decideUnitScale(const CloudT& cloud){
-    if (unit_scale_param_>0 && std::abs(unit_scale_param_-1.0)>1e-9) return unit_scale_param_;
-    if (!auto_unit_scale_) return 1.0;
-    std::vector<double> r; r.reserve(std::min<size_t>(cloud.size(), 1000));
-    size_t step = std::max<size_t>(1, cloud.size()/1000);
-    for (size_t i=0;i<cloud.size(); i+=step){
-      const auto &p = cloud[i];
-      r.push_back(std::sqrt(double(p.x)*p.x + double(p.y)*p.y + double(p.z)*p.z));
-    }
-    double med = median(r);
-    return (med > 100.0) ? 0.001 : 1.0;
-  }
-
-  // 提取每点相对时间
-  std::vector<double> extractPointTimes(const sensor_msgs::msg::PointCloud2& msg){
-    const size_t N = static_cast<size_t>(msg.width) * static_cast<size_t>(msg.height);
-    std::vector<double> rel(N, 0.0);
-    bool has_time=false;
-    for (const auto& f: msg.fields) if (f.name==time_field_name_) { has_time=true; break; }
-
-    if (has_time){
-      sensor_msgs::PointCloud2ConstIterator<float> it_t(msg, time_field_name_);
-      for (size_t i=0; i<N && it_t!=it_t.end(); ++i, ++it_t) rel[i]=static_cast<double>(*it_t);
-      double tmin=rel.front(), tmax=rel.front();
-      for (double v:rel){ tmin=std::min(tmin,v); tmax=std::max(tmax,v); }
-      double tref = deskew_ref_end_ ? tmax : tmin;
-      for (double &v:rel) v -= tref;
-    }else{
-      if (N<=1 || scan_period_<=0.0) return rel;
-      for (size_t i=0;i<N;++i){
-        double frac = static_cast<double>(i) / static_cast<double>(N-1);
-        rel[i] = frac * scan_period_;
-      }
-      double tref = deskew_ref_end_ ? scan_period_ : 0.0;
-      for (double &v:rel) v -= tref;
-      static bool warned=false;
-      if (!warned && enable_deskew_){
-        warned=true;
-        RCLCPP_WARN(get_logger(), "Deskew: no '%s' field. Using linear approx with scan_period=%.3f s.",
-                    time_field_name_.c_str(), scan_period_);
-      }
-    }
-    return rel;
-  }
-
-  // odom 插值查找（odom->base）
-  std::optional<Eigen::Matrix4f> getOdomPoseAt(const rclcpp::Time& t){
-    std::lock_guard<std::mutex> lk(odom_mtx_);
-    if (odom_buf_.size()<2) return std::nullopt;
-    if (t < odom_buf_.front().stamp || t > odom_buf_.back().stamp) return std::nullopt;
-    size_t lo=0, hi=odom_buf_.size()-1;
-    while (hi-lo>1){
-      size_t mid=(lo+hi)/2;
-      if (odom_buf_[mid].stamp <= t) lo=mid; else hi=mid;
-    }
-    const auto &A=odom_buf_[lo], &B=odom_buf_[hi];
-    double dt=(B.stamp-A.stamp).seconds();
-    if (dt<=1e-6) return A.T;
-    double alpha=(t-A.stamp).seconds()/dt;
-    return interpolateSE3(A.T, B.T, alpha);
-  }
-
-  // cloud 原地左乘 4x4（P := T * P）
-  static void transformCloudInPlace(CloudT& cloud, const Eigen::Matrix4f& T){
-    const Eigen::Matrix3f R = T.block<3,3>(0,0);
-    const Eigen::Vector3f t = T.block<3,1>(0,3);
-    for (auto &p : cloud){
-      Eigen::Vector3f v(p.x, p.y, p.z);
-      v = R * v + t;
-      p.x = v.x(); p.y = v.y(); p.z = v.z();
-    }
-  }
-
-  // --------- 订阅回调 ---------
-  void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg){
-    TimedPose tp{ rclcpp::Time(msg->header.stamp), poseMsgToMat4(msg->pose.pose) };
-    {
-      std::lock_guard<std::mutex> lk(odom_mtx_);
-      odom_buf_.push_back(tp);
-      const double keep_sec=8.0;
-      while (!odom_buf_.empty() && (tp.stamp - odom_buf_.front().stamp).seconds() > keep_sec)
-        odom_buf_.pop_front();
-    }
-    // 也存最新一条，作为后备
-    std::lock_guard<std::mutex> lk2(odom_latest_mtx_);
-    T_odom_latest_ = tp.T;
-    have_odom_latest_ = true;
-  }
-
-  void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-    // 读入点云（兼容无rgb）
-    CloudT::Ptr cloud(new CloudT());
-    bool had_rgb=false;
-    if (!msgToCloudXYZRGB(*msg, cloud, had_rgb)) return;
-    if (cloud->empty()) return;
-
-    // 单位归一化
-    const double s = decideUnitScale(*cloud);
-    if (std::abs(s-1.0) > 1e-9){
-      for (auto &p : *cloud){ p.x*=s; p.y*=s; p.z*=s; }
-      if (debug_log_) RCLCPP_INFO(get_logger(), "Applied unit scale %.6f", s);
-    }
-
-    // per-point time & deskew（在传感器系）
-    std::vector<double> rel_times;
-    if (enable_deskew_) rel_times = extractPointTimes(*msg);
-    std::vector<int> idx;
-    pcl::removeNaNFromPointCloud(*cloud, *cloud, idx);
-    if (cloud->empty()) return;
-
-    // 距离裁剪
-    const double min_r2 = min_range_*min_range_, max_r2 = max_range_*max_range_;
-    CloudT::Ptr ranged(new CloudT()); ranged->reserve(cloud->size());
-    std::vector<double> times_ranged; times_ranged.reserve(cloud->size());
-    for (size_t i=0;i<cloud->size();++i){
-      const auto &p = (*cloud)[i];
-      const double r2 = double(p.x)*p.x + double(p.y)*p.y + double(p.z)*p.z;
-      if (std::isfinite(r2) && r2>=min_r2 && r2<=max_r2){
-        ranged->push_back(p);
-        if (enable_deskew_) times_ranged.push_back(i<rel_times.size()?rel_times[i]:0.0);
-      }
-    }
-    if (ranged->empty()) return;
-
-    // === 获取该帧的 odom 位姿（odom->base）并构造 map 位姿 ===
-    // T_global_ 代表 (map->base) 的当前解；T_map_odom_ 是桥 (map->odom)
-    Eigen::Matrix4f T_odom_now;
-    bool have_now = false;
-    if (auto T_ref = getOdomPoseAt(msg->header.stamp); T_ref.has_value()){
-      T_odom_now = *T_ref; have_now = true;
-    } else {
-      std::lock_guard<std::mutex> lk2(odom_latest_mtx_);
-      if (have_odom_latest_) { T_odom_now = T_odom_latest_; have_now = true; }
-    }
-    if (!have_now){
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "No odom for this cloud. Skip.");
-      return;
-    }
-
-    // 首帧初始化：把第一帧的 odom 原点锚定到 map（T_map_odom_=I 即 map≡odom）
-    if (!map_initialized_){
-      // 体素
-      pcl::VoxelGrid<PointT> vg;
-      vg.setLeafSize(leaf_size_, leaf_size_, leaf_size_);
-      vg.setInputCloud(ranged);
-      CloudT::Ptr filtered(new CloudT());
-      vg.filter(*filtered);
-      if (filtered->empty()) return;
-
-      T_map_odom_.setIdentity();        // map 与 odom 对齐
-      T_global_ = T_map_odom_ * T_odom_now; // map->base
-      last_fused_T_ = T_global_;
-
-      // 把第一帧转到 map 系并存为地图
-      CloudT::Ptr first_in_map(new CloudT(*filtered));
-      transformCloudInPlace(*first_in_map, T_global_);
-      map_cloud_ = first_in_map;
-      map_initialized_ = true;
-      fused_count_ = 1;
-
-      publishAll(msg->header.stamp);
-      RCLCPP_INFO(get_logger(), "Init map (pure-odom). pts=%zu (rgb=%d)", map_cloud_->size(), (int)had_rgb);
-      return;
-    }
-
-    // deskew：在 odom 系下把每个点扭到参考时刻，然后再乘 map<-odom
-    if (enable_deskew_) deskewInOdom(*ranged, times_ranged, msg->header.stamp);
-
-    // 体素
-    pcl::VoxelGrid<PointT> vg;
-    vg.setLeafSize(leaf_size_, leaf_size_, leaf_size_);
-    vg.setInputCloud(ranged);
-    CloudT::Ptr filtered(new CloudT());
-    vg.filter(*filtered);
-    if (filtered->empty()) return;
-
-    // 计算当前帧的 map 位姿（map->base）
-    T_global_ = T_map_odom_ * T_odom_now;
-
-    // 关键帧融合（把本帧点云乘以 T_global_ 再叠加）
-    if (shouldFuse(T_global_, last_fused_T_)){
-      CloudT::Ptr in_map(new CloudT(*filtered));
-      transformCloudInPlace(*in_map, T_global_);
-      {
-        std::lock_guard<std::mutex> lk(map_mutex_);
-        *map_cloud_ += *in_map;
-        ++fused_count_;
-        if (global_voxel_every_n_<=1 || (fused_count_%global_voxel_every_n_==0)){
-          vg.setInputCloud(map_cloud_);
-          CloudT::Ptr down(new CloudT());
-          vg.filter(*down);
-          map_cloud_.swap(down);
-        }
-      }
-      last_fused_T_ = T_global_;
-    }
-
-    publishAll(msg->header.stamp);
-  }
-
-  // deskew：把每点从Ti扭到Tref（这里在 odom 系内完成）
-  void deskewInOdom(CloudT& cloud, const std::vector<double>& rel_times, const rclcpp::Time& frame_stamp){
-    if (!enable_deskew_) return;
-    if (cloud.size()!=rel_times.size()) return;
-    auto T_ref_opt = getOdomPoseAt(frame_stamp);
-    if (!T_ref_opt.has_value()){
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Deskew skipped: no odom at frame time.");
-      return;
-    }
-    const Eigen::Matrix4f T_ref = *T_ref_opt;
-    for (size_t i=0;i<cloud.size();++i){
-      rclcpp::Time ti = frame_stamp + rclcpp::Duration::from_seconds(rel_times[i]);
-      auto T_i_opt = getOdomPoseAt(ti);
-      if (!T_i_opt.has_value()) continue;
-      const Eigen::Matrix4f T_i = *T_i_opt;
-      Eigen::Matrix3f R = T_ref.block<3,3>(0,0) * T_i.block<3,3>(0,0).transpose();
-      Eigen::Vector3f t = T_ref.block<3,1>(0,3) - R * T_i.block<3,1>(0,3);
-      Eigen::Vector3f p(cloud[i].x, cloud[i].y, cloud[i].z);
-      Eigen::Vector3f q = R * p + t;
-      cloud[i].x = q.x(); cloud[i].y = q.y(); cloud[i].z = q.z();
-    }
-  }
-
-  // 是否融合为关键帧
-  bool shouldFuse(const Eigen::Matrix4f& T_now, const Eigen::Matrix4f& T_last){
-    Eigen::Vector3f t_now = T_now.block<3,1>(0,3), t_last = T_last.block<3,1>(0,3);
-    double trans = (t_now - t_last).norm();
-    Eigen::Matrix3f R = T_last.block<3,3>(0,0).transpose() * T_now.block<3,3>(0,0);
-    double ang = std::acos(std::min(1.0f,std::max(-1.0f,(R.trace()-1.0f)/2.0f)));
-    double deg = ang * 180.0 / M_PI;
-    return (trans >= kf_trans_thresh_) || (deg >= kf_rot_deg_thresh_);
-  }
-
-  // --------- 发布/保存 ---------
-  void publishAll(const rclcpp::Time &stamp) {
-    // 地图
-    if (!map_cloud_ || map_cloud_->empty()) return;
-    sensor_msgs::msg::PointCloud2 out;
-    pcl::toROSMsg(*map_cloud_, out);
-    out.header.frame_id = output_frame_;
-    out.header.stamp = stamp;
-    map_pub_->publish(out);
-
-    // 里程计（map->base）
-    Eigen::Matrix3f R = T_global_.block<3,3>(0,0);
-    Eigen::Vector3f t = T_global_.block<3,1>(0,3);
-    Eigen::Quaternionf q(R);
-
-    nav_msgs::msg::Odometry odom;
-    odom.header.frame_id = output_frame_;
-    odom.child_frame_id = "mapping_base";
-    odom.header.stamp = stamp;
-    odom.pose.pose.position.x = t.x();
-    odom.pose.pose.position.y = t.y();
-    odom.pose.pose.position.z = t.z();
-    odom.pose.pose.orientation.x = q.x();
-    odom.pose.pose.orientation.y = q.y();
-    odom.pose.pose.orientation.z = q.z();
-    odom.pose.pose.orientation.w = q.w();
-    odom_pub_->publish(odom);
-
-    // 轨迹缓存（用于保存 CSV）
-    traj_.push_back({stamp, t, q});
-  }
-
-  void onTimer(){
-    std::lock_guard<std::mutex> lk(map_mutex_);
-    if (!map_cloud_ || map_cloud_->empty()){
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000, "Auto-save skipped: map empty.");
-      return;
-    }
-    (void)saveNowUnlocked();
-  }
-
-  void saveService(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-                   std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
-    std::lock_guard<std::mutex> lk(map_mutex_);
-    res->success = saveNowUnlocked();
-    res->message = res->success ? "Map saved." : "Save failed.";
-  }
-
-  bool saveNowUnlocked() {
-    if (!map_cloud_ || map_cloud_->empty()){
-      RCLCPP_WARN(get_logger(), "Map empty, skip save.");
-      return false;
-    }
-    // 拷贝一份避免长时间持锁
-    CloudT::Ptr map_copy(new CloudT(*map_cloud_));
-    const rclcpp::Time now = this->now();
-
-    // 文件名
-    std::ostringstream oss;
-    oss << "map";
-    if (stamp_in_name_) {
-      const int64_t sec  = now.seconds(); // floor 秒
-      const int64_t nsec = now.nanoseconds() % 1000000000LL;
-      oss << "_" << sec << "_" << std::setw(9) << std::setfill('0') << nsec;
-    }
-    const std::string base = oss.str();
-    const std::string path = save_dir_ + "/" + base + (save_format_=="pcd" ? ".pcd" : ".ply");
-
-    int ret = 0;
-    if (save_format_=="pcd") ret = pcl::io::savePCDFileBinary(path, *map_copy);
-    else                     ret = pcl::io::savePLYFileBinary(path, *map_copy);
-
-    if (ret != 0) {
-      RCLCPP_ERROR(get_logger(), "Failed to save map to %s", path.c_str());
-      return false;
-    }
-    RCLCPP_INFO(get_logger(), "Saved map: %s (pts=%zu)", path.c_str(), map_copy->size());
-
-    if (save_traj_csv_) {
-      saveTrajectoryCSV(base);
-    }
-    return true;
-  }
-
-  void saveTrajectoryCSV(const std::string& base){
-    if (traj_.empty()){
-      RCLCPP_WARN(get_logger(), "No trajectory cached. Skip CSV.");
-      return;
-    }
-    const std::string csv = save_dir_ + "/" + base + "_traj.csv";
-    std::ofstream ofs(csv);
-    if (!ofs.is_open()){
-      RCLCPP_ERROR(get_logger(), "Cannot open %s", csv.c_str());
-      return;
-    }
-    ofs << "sec,nsec,x,y,z,qx,qy,qz,qw\n";
-    for (const auto& e : traj_){
-      const int64_t sec  = e.stamp.seconds();
-      const int64_t nsec = e.stamp.nanoseconds() % 1000000000LL;
-      ofs << sec << "," << nsec << ","
-          << e.t.x() << "," << e.t.y() << "," << e.t.z() << ","
-          << e.q.x() << "," << e.q.y() << "," << e.q.z() << "," << e.q.w() << "\n";
-    }
-    ofs.close();
-    RCLCPP_INFO(get_logger(), "Saved trajectory CSV: %s (rows=%zu)", csv.c_str(), traj_.size());
-  }
-
-  // --------- 成员 ---------
-  // 参数
-  std::string input_topic_, output_frame_, save_dir_, save_format_, time_field_name_;
-  bool   enable_deskew_, deskew_ref_end_, auto_unit_scale_, debug_log_;
-  bool   stamp_in_name_, save_traj_csv_;
-  int    global_voxel_every_n_;
-  double leaf_size_, min_range_, max_range_;
-  double scan_period_, unit_scale_param_;
-  double kf_trans_thresh_, kf_rot_deg_thresh_;
-  double save_period_sec_;
-
-  // ROS I/O
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
-  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_srv_;
-  rclcpp::TimerBase::SharedPtr timer_;
-
-  // 地图/位姿
-  std::mutex map_mutex_;
-  pcl::PointCloud<PointT>::Ptr map_cloud_{ new pcl::PointCloud<PointT>() };
-  bool map_initialized_{false};
-  Eigen::Matrix4f T_global_{Eigen::Matrix4f::Identity()};     // map->base
-  Eigen::Matrix4f last_fused_T_{Eigen::Matrix4f::Identity()};
-  size_t fused_count_{0};
-  Eigen::Matrix4f T_map_odom_{Eigen::Matrix4f::Identity()};   // map->odom
-
-  // 里程计缓存
-  std::mutex odom_mtx_;
-  std::deque<TimedPose> odom_buf_;
-  std::mutex odom_latest_mtx_;
-  Eigen::Matrix4f T_odom_latest_{Eigen::Matrix4f::Identity()};
-  bool have_odom_latest_{false};
-
-  // 轨迹缓存（用于CSV）
-  std::vector<TrajEntry> traj_;
+// 关键帧结构体
+struct KeyFrame {
+    int id;
+    Eigen::Matrix4f pose;
+    PointCloudT::Ptr cloud;
+    std::chrono::steady_clock::time_point timestamp;
+    
+    KeyFrame(int id_, const Eigen::Matrix4f& pose_, PointCloudT::Ptr cloud_)
+        : id(id_), pose(pose_), cloud(cloud_), timestamp(std::chrono::steady_clock::now()) {}
 };
 
-int main(int argc, char** argv){
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<MappingNode>());
-  rclcpp::shutdown();
-  return 0;
+// 回环约束结构体
+struct LoopConstraint {
+    int from_id;
+    int to_id;
+    Eigen::Matrix4f relative_pose;
+    double confidence;
+    
+    LoopConstraint(int from, int to, const Eigen::Matrix4f& pose, double conf)
+        : from_id(from), to_id(to), relative_pose(pose), confidence(conf) {}
+};
+
+// 轨迹点结构体
+struct TrajectoryPoint {
+    Eigen::Vector3f position;
+    Eigen::Quaternionf orientation;
+    std::chrono::steady_clock::time_point timestamp;
+    
+    TrajectoryPoint(const Eigen::Matrix4f& pose)
+        : timestamp(std::chrono::steady_clock::now()) {
+        position = pose.block<3,1>(0,3);
+        Eigen::Matrix3f rotation = pose.block<3,3>(0,0);
+        orientation = Eigen::Quaternionf(rotation);
+    }
+};
+
+class MappingNode : public rclcpp::Node {
+public:
+    MappingNode() : Node("mapping_node"), 
+                   map_initialized_(false),
+                   keyframe_counter_(0),
+                   loop_detection_enabled_(true),
+                   pose_graph_optimization_enabled_(true),
+                   shutdown_requested_(false) {
+        
+        // 参数声明
+        this->declare_parameter("input_topic", "/odin/points");
+        this->declare_parameter("save_directory", "./maps");
+        this->declare_parameter("leaf_size", 0.1);
+        this->declare_parameter("icp_max_correspondence_distance", 1.0);
+        this->declare_parameter("icp_transformation_epsilon", 1e-6);
+        this->declare_parameter("icp_euclidean_fitness_epsilon", 1e-6);
+        this->declare_parameter("icp_max_iterations", 50);
+        this->declare_parameter("max_range", 50.0);
+        this->declare_parameter("min_range", 0.5);
+        
+        // 新增SLAM参数
+        this->declare_parameter("keyframe_distance_threshold", 1.0);
+        this->declare_parameter("keyframe_angle_threshold", 0.3);
+        this->declare_parameter("max_map_size", 1000000);
+        this->declare_parameter("loop_closure_distance_threshold", 3.0);
+        this->declare_parameter("loop_closure_score_threshold", 0.6);
+        this->declare_parameter("pose_graph_optimization_interval", 10);
+        this->declare_parameter("trajectory_save_interval", 100);
+        
+        // 获取参数
+        input_topic_ = this->get_parameter("input_topic").as_string();
+        save_directory_ = this->get_parameter("save_directory").as_string();
+        leaf_size_ = this->get_parameter("leaf_size").as_double();
+        icp_max_correspondence_distance_ = this->get_parameter("icp_max_correspondence_distance").as_double();
+        icp_transformation_epsilon_ = this->get_parameter("icp_transformation_epsilon").as_double();
+        icp_euclidean_fitness_epsilon_ = this->get_parameter("icp_euclidean_fitness_epsilon").as_double();
+        icp_max_iterations_ = this->get_parameter("icp_max_iterations").as_int();
+        max_range_ = this->get_parameter("max_range").as_double();
+        min_range_ = this->get_parameter("min_range").as_double();
+        
+        keyframe_distance_threshold_ = this->get_parameter("keyframe_distance_threshold").as_double();
+        keyframe_angle_threshold_ = this->get_parameter("keyframe_angle_threshold").as_double();
+        max_map_size_ = this->get_parameter("max_map_size").as_int();
+        loop_closure_distance_threshold_ = this->get_parameter("loop_closure_distance_threshold").as_double();
+        loop_closure_score_threshold_ = this->get_parameter("loop_closure_score_threshold").as_double();
+        pose_graph_optimization_interval_ = this->get_parameter("pose_graph_optimization_interval").as_int();
+        trajectory_save_interval_ = this->get_parameter("trajectory_save_interval").as_int();
+        
+        // 创建发布器
+        map_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/mapping/accumulated_map", 10);
+        odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/mapping/odometry", 10);
+        trajectory_pub_ = this->create_publisher<nav_msgs::msg::Path>("/mapping/trajectory", 10);
+        
+        // 创建订阅器
+        cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+            input_topic_, 10, std::bind(&MappingNode::cloudCallback, this, std::placeholders::_1));
+        
+        // 创建服务
+        save_service_ = this->create_service<std_srvs::srv::Trigger>(
+            "/mapping/save_map", std::bind(&MappingNode::saveService, this, std::placeholders::_1, std::placeholders::_2));
+        
+        reset_service_ = this->create_service<std_srvs::srv::Trigger>(
+            "/mapping/reset", std::bind(&MappingNode::resetService, this, std::placeholders::_1, std::placeholders::_2));
+        
+        loop_closure_service_ = this->create_service<std_srvs::srv::SetBool>(
+            "/mapping/enable_loop_closure", std::bind(&MappingNode::loopClosureService, this, std::placeholders::_1, std::placeholders::_2));
+        
+        // 初始化点云
+        accumulated_map_ = std::make_shared<PointCloudT>();
+        current_pose_ = Eigen::Matrix4f::Identity();
+        
+        // 创建保存目录
+        std::filesystem::create_directories(save_directory_);
+        
+        // 启动后台线程
+        loop_detection_thread_ = std::thread(&MappingNode::loopDetectionThread, this);
+        pose_graph_thread_ = std::thread(&MappingNode::poseGraphOptimizationThread, this);
+        
+        RCLCPP_INFO(this->get_logger(), "Enhanced SLAM Mapping Node initialized");
+        RCLCPP_INFO(this->get_logger(), "Input topic: %s", input_topic_.c_str());
+        RCLCPP_INFO(this->get_logger(), "Save directory: %s", save_directory_.c_str());
+    }
+    
+    ~MappingNode() {
+        shutdown_requested_ = true;
+        if (loop_detection_thread_.joinable()) {
+            loop_detection_thread_.join();
+        }
+        if (pose_graph_thread_.joinable()) {
+            pose_graph_thread_.join();
+        }
+        
+        // 保存最终轨迹
+        saveTrajectory();
+        RCLCPP_INFO(this->get_logger(), "SLAM Mapping Node shutdown complete");
+    }
+
+private:
+    void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        
+        // ROS2 -> PCL 转换
+        PointCloudT::Ptr cloud(new PointCloudT);
+        pcl::fromROSMsg(*msg, *cloud);
+        
+        // 预处理
+        cloud = preprocessCloud(cloud);
+        if (cloud->empty()) {
+            RCLCPP_WARN(this->get_logger(), "Empty cloud after preprocessing");
+            return;
+        }
+        
+        // 第一帧处理
+        if (!map_initialized_) {
+            initializeMap(cloud);
+            return;
+        }
+        
+        // ICP配准
+        Eigen::Matrix4f transformation;
+        double fitness_score;
+        if (!performICP(cloud, transformation, fitness_score)) {
+            RCLCPP_WARN(this->get_logger(), "ICP failed, skipping frame");
+            return;
+        }
+        
+        // 更新位姿
+        current_pose_ = current_pose_ * transformation;
+        
+        // 记录轨迹
+        trajectory_.emplace_back(current_pose_);
+        
+        // 检查是否需要创建关键帧
+        if (shouldCreateKeyframe(transformation)) {
+            createKeyframe(cloud);
+        }
+        
+        // 更新地图
+        updateMap(cloud);
+        
+        // 发布结果
+        publishAll();
+        
+        // 定期保存轨迹
+        if (trajectory_.size() % trajectory_save_interval_ == 0) {
+            saveTrajectory();
+        }
+    }
+    
+    PointCloudT::Ptr preprocessCloud(PointCloudT::Ptr cloud) {
+        // 移除NaN和Inf点
+        std::vector<int> indices;
+        pcl::removeNaNFromPointCloud(*cloud, *cloud, indices);
+        
+        // 距离过滤
+        PointCloudT::Ptr filtered_cloud(new PointCloudT);
+        for (const auto& point : cloud->points) {
+            float distance = std::sqrt(point.x * point.x + point.y * point.y + point.z * point.z);
+            if (distance >= min_range_ && distance <= max_range_) {
+                filtered_cloud->points.push_back(point);
+            }
+        }
+        filtered_cloud->width = filtered_cloud->points.size();
+        filtered_cloud->height = 1;
+        filtered_cloud->is_dense = true;
+        
+        // 统计滤波去除离群点
+        pcl::StatisticalOutlierRemoval<PointT> sor;
+        sor.setInputCloud(filtered_cloud);
+        sor.setMeanK(20);
+        sor.setStddevMulThresh(2.0);
+        PointCloudT::Ptr clean_cloud(new PointCloudT);
+        sor.filter(*clean_cloud);
+        
+        // 体素下采样
+        pcl::VoxelGrid<PointT> voxel_filter;
+        voxel_filter.setInputCloud(clean_cloud);
+        voxel_filter.setLeafSize(leaf_size_, leaf_size_, leaf_size_);
+        PointCloudT::Ptr downsampled_cloud(new PointCloudT);
+        voxel_filter.filter(*downsampled_cloud);
+        
+        return downsampled_cloud;
+    }
+    
+    void initializeMap(PointCloudT::Ptr cloud) {
+        *accumulated_map_ = *cloud;
+        map_initialized_ = true;
+        
+        // 创建第一个关键帧
+        createKeyframe(cloud);
+        
+        RCLCPP_INFO(this->get_logger(), "Map initialized with %zu points", cloud->size());
+    }
+    
+    bool performICP(PointCloudT::Ptr cloud, Eigen::Matrix4f& transformation, double& fitness_score) {
+        pcl::IterativeClosestPoint<PointT, PointT> icp;
+        
+        // 配置ICP参数
+        icp.setInputSource(cloud);
+        icp.setInputTarget(accumulated_map_);
+        icp.setMaxCorrespondenceDistance(icp_max_correspondence_distance_);
+        icp.setTransformationEpsilon(icp_transformation_epsilon_);
+        icp.setEuclideanFitnessEpsilon(icp_euclidean_fitness_epsilon_);
+        icp.setMaximumIterations(icp_max_iterations_);
+        
+        // 使用RANSAC提高鲁棒性
+        icp.setRANSACOutlierRejectionThreshold(0.1);
+        icp.setRANSACIterations(100);
+        
+        PointCloudT::Ptr aligned_cloud(new PointCloudT);
+        icp.align(*aligned_cloud);
+        
+        if (!icp.hasConverged()) {
+            RCLCPP_WARN(this->get_logger(), "ICP did not converge");
+            return false;
+        }
+        
+        fitness_score = icp.getFitnessScore();
+        transformation = icp.getFinalTransformation();
+        
+        // 检查配准质量
+        if (fitness_score > 0.5) {
+            RCLCPP_WARN(this->get_logger(), "Poor ICP fitness score: %f", fitness_score);
+            return false;
+        }
+        
+        return true;
+    }
+    
+    bool shouldCreateKeyframe(const Eigen::Matrix4f& transformation) {
+        // 计算平移距离
+        Eigen::Vector3f translation = transformation.block<3,1>(0,3);
+        double distance = translation.norm();
+        
+        // 计算旋转角度
+        Eigen::Matrix3f rotation = transformation.block<3,3>(0,0);
+        Eigen::AngleAxisf angle_axis(rotation);
+        double angle = std::abs(angle_axis.angle());
+        
+        return (distance > keyframe_distance_threshold_ || angle > keyframe_angle_threshold_);
+    }
+    
+    void createKeyframe(PointCloudT::Ptr cloud) {
+        auto keyframe = std::make_shared<KeyFrame>(keyframe_counter_++, current_pose_, cloud);
+        keyframes_.push_back(keyframe);
+        
+        RCLCPP_INFO(this->get_logger(), "Created keyframe %d at position [%.2f, %.2f, %.2f]", 
+                   keyframe->id, current_pose_(0,3), current_pose_(1,3), current_pose_(2,3));
+        
+        // 触发回环检测
+        if (loop_detection_enabled_ && keyframes_.size() > 10) {
+            std::lock_guard<std::mutex> lock(loop_mutex_);
+            loop_detection_queue_.push_back(keyframe);
+        }
+    }
+    
+    void updateMap(PointCloudT::Ptr cloud) {
+        // 将点云变换到全局坐标系
+        PointCloudT::Ptr transformed_cloud(new PointCloudT);
+        pcl::transformPointCloud(*cloud, *transformed_cloud, current_pose_);
+        
+        // 添加到累积地图
+        *accumulated_map_ += *transformed_cloud;
+        
+        // 地图大小管理
+        if (accumulated_map_->size() > max_map_size_) {
+            // 体素下采样压缩地图
+            pcl::VoxelGrid<PointT> voxel_filter;
+            voxel_filter.setInputCloud(accumulated_map_);
+            voxel_filter.setLeafSize(leaf_size_ * 1.5, leaf_size_ * 1.5, leaf_size_ * 1.5);
+            PointCloudT::Ptr compressed_map(new PointCloudT);
+            voxel_filter.filter(*compressed_map);
+            accumulated_map_ = compressed_map;
+            
+            RCLCPP_INFO(this->get_logger(), "Map compressed to %zu points", accumulated_map_->size());
+        }
+    }
+    
+    void loopDetectionThread() {
+        while (!shutdown_requested_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            
+            if (!loop_detection_enabled_) continue;
+            
+            std::vector<std::shared_ptr<KeyFrame>> candidates;
+            {
+                std::lock_guard<std::mutex> lock(loop_mutex_);
+                if (loop_detection_queue_.empty()) continue;
+                
+                candidates = loop_detection_queue_;
+                loop_detection_queue_.clear();
+            }
+            
+            for (auto& current_kf : candidates) {
+                detectLoopClosure(current_kf);
+            }
+        }
+    }
+    
+    void detectLoopClosure(std::shared_ptr<KeyFrame> current_kf) {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        
+        for (auto& candidate_kf : keyframes_) {
+            // 跳过时间太近的关键帧
+            if (std::abs(current_kf->id - candidate_kf->id) < 30) continue;
+            
+            // 计算距离
+            Eigen::Vector3f pos1 = current_kf->pose.block<3,1>(0,3);
+            Eigen::Vector3f pos2 = candidate_kf->pose.block<3,1>(0,3);
+            double distance = (pos1 - pos2).norm();
+            
+            if (distance < loop_closure_distance_threshold_) {
+                // 尝试ICP验证
+                if (verifyLoopClosure(current_kf, candidate_kf)) {
+                    RCLCPP_INFO(this->get_logger(), "Loop closure detected between keyframes %d and %d", 
+                               current_kf->id, candidate_kf->id);
+                }
+            }
+        }
+    }
+    
+    bool verifyLoopClosure(std::shared_ptr<KeyFrame> kf1, std::shared_ptr<KeyFrame> kf2) {
+        pcl::IterativeClosestPoint<PointT, PointT> icp;
+        icp.setInputSource(kf1->cloud);
+        icp.setInputTarget(kf2->cloud);
+        icp.setMaxCorrespondenceDistance(1.0);
+        icp.setMaximumIterations(100);
+        
+        PointCloudT::Ptr aligned_cloud(new PointCloudT);
+        icp.align(*aligned_cloud);
+        
+        if (icp.hasConverged() && icp.getFitnessScore() < loop_closure_score_threshold_) {
+            // 添加回环约束
+            Eigen::Matrix4f relative_pose = icp.getFinalTransformation();
+            auto constraint = std::make_shared<LoopConstraint>(
+                kf1->id, kf2->id, relative_pose, 1.0 - icp.getFitnessScore());
+            
+            std::lock_guard<std::mutex> lock(loop_mutex_);
+            loop_constraints_.push_back(constraint);
+            
+            return true;
+        }
+        
+        return false;
+    }
+    
+    void poseGraphOptimizationThread() {
+        while (!shutdown_requested_) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            
+            if (!pose_graph_optimization_enabled_) continue;
+            
+            if (keyframes_.size() % pose_graph_optimization_interval_ == 0 && !loop_constraints_.empty()) {
+                optimizePoseGraph();
+            }
+        }
+    }
+    
+    void optimizePoseGraph() {
+        std::lock_guard<std::mutex> lock1(map_mutex_);
+        std::lock_guard<std::mutex> lock2(loop_mutex_);
+        
+        // 简化的位姿图优化（这里使用基础的最小二乘法）
+        // 在实际应用中，应该使用g2o或GTSAM等专业库
+        
+        RCLCPP_INFO(this->get_logger(), "Performing pose graph optimization with %zu constraints", 
+                   loop_constraints_.size());
+        
+        // 更新关键帧位姿后，重建地图
+        rebuildMap();
+    }
+    
+    void rebuildMap() {
+        accumulated_map_->clear();
+        
+        for (auto& kf : keyframes_) {
+            PointCloudT::Ptr transformed_cloud(new PointCloudT);
+            pcl::transformPointCloud(*kf->cloud, *transformed_cloud, kf->pose);
+            *accumulated_map_ += *transformed_cloud;
+        }
+        
+        // 压缩地图
+        pcl::VoxelGrid<PointT> voxel_filter;
+        voxel_filter.setInputCloud(accumulated_map_);
+        voxel_filter.setLeafSize(leaf_size_, leaf_size_, leaf_size_);
+        PointCloudT::Ptr compressed_map(new PointCloudT);
+        voxel_filter.filter(*compressed_map);
+        accumulated_map_ = compressed_map;
+        
+        RCLCPP_INFO(this->get_logger(), "Map rebuilt with %zu points", accumulated_map_->size());
+    }
+    
+    void publishAll() {
+        auto now = this->get_clock()->now();
+        
+        // 发布地图
+        if (!accumulated_map_->empty()) {
+            sensor_msgs::msg::PointCloud2 map_msg;
+            pcl::toROSMsg(*accumulated_map_, map_msg);
+            map_msg.header.stamp = now;
+            map_msg.header.frame_id = "map";
+            map_pub_->publish(map_msg);
+        }
+        
+        // 发布里程计
+        nav_msgs::msg::Odometry odom_msg;
+        odom_msg.header.stamp = now;
+        odom_msg.header.frame_id = "map";
+        odom_msg.child_frame_id = "base_link";
+        
+        // 位置
+        odom_msg.pose.pose.position.x = current_pose_(0, 3);
+        odom_msg.pose.pose.position.y = current_pose_(1, 3);
+        odom_msg.pose.pose.position.z = current_pose_(2, 3);
+        
+        // 姿态
+        Eigen::Matrix3f rotation = current_pose_.block<3,3>(0,0);
+        Eigen::Quaternionf quat(rotation);
+        odom_msg.pose.pose.orientation.x = quat.x();
+        odom_msg.pose.pose.orientation.y = quat.y();
+        odom_msg.pose.pose.orientation.z = quat.z();
+        odom_msg.pose.pose.orientation.w = quat.w();
+        
+        odom_pub_->publish(odom_msg);
+        
+        // 发布轨迹
+        publishTrajectory();
+    }
+    
+    void publishTrajectory() {
+        nav_msgs::msg::Path path_msg;
+        path_msg.header.stamp = this->get_clock()->now();
+        path_msg.header.frame_id = "map";
+        
+        for (const auto& traj_point : trajectory_) {
+            geometry_msgs::msg::PoseStamped pose_stamped;
+            pose_stamped.header.frame_id = "map";
+            pose_stamped.pose.position.x = traj_point.position.x();
+            pose_stamped.pose.position.y = traj_point.position.y();
+            pose_stamped.pose.position.z = traj_point.position.z();
+            pose_stamped.pose.orientation.x = traj_point.orientation.x();
+            pose_stamped.pose.orientation.y = traj_point.orientation.y();
+            pose_stamped.pose.orientation.z = traj_point.orientation.z();
+            pose_stamped.pose.orientation.w = traj_point.orientation.w();
+            
+            path_msg.poses.push_back(pose_stamped);
+        }
+        
+        trajectory_pub_->publish(path_msg);
+    }
+    
+    void saveTrajectory() {
+        std::string trajectory_file = save_directory_ + "/trajectory.txt";
+        std::ofstream file(trajectory_file);
+        
+        if (file.is_open()) {
+            file << "# timestamp x y z qx qy qz qw\n";
+            for (size_t i = 0; i < trajectory_.size(); ++i) {
+                const auto& point = trajectory_[i];
+                file << i << " " 
+                     << point.position.x() << " " << point.position.y() << " " << point.position.z() << " "
+                     << point.orientation.x() << " " << point.orientation.y() << " " 
+                     << point.orientation.z() << " " << point.orientation.w() << "\n";
+            }
+            file.close();
+            RCLCPP_INFO(this->get_logger(), "Trajectory saved to %s", trajectory_file.c_str());
+        }
+    }
+    
+    void saveService(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+                    std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        (void)request;
+        
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        
+        if (accumulated_map_->empty()) {
+            response->success = false;
+            response->message = "No map to save";
+            return;
+        }
+        
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        auto tm = *std::localtime(&time_t);
+        
+        char timestamp[100];
+        std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &tm);
+        
+        std::string pcd_filename = save_directory_ + "/map_" + timestamp + ".pcd";
+        std::string ply_filename = save_directory_ + "/map_" + timestamp + ".ply";
+        
+        try {
+            pcl::io::savePCDFileBinary(pcd_filename, *accumulated_map_);
+            pcl::io::savePLYFileBinary(ply_filename, *accumulated_map_);
+            
+            // 保存轨迹
+            saveTrajectory();
+            
+            response->success = true;
+            response->message = "Map saved successfully to " + pcd_filename + " and " + ply_filename;
+            RCLCPP_INFO(this->get_logger(), "%s", response->message.c_str());
+        } catch (const std::exception& e) {
+            response->success = false;
+            response->message = "Failed to save map: " + std::string(e.what());
+            RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+        }
+    }
+    
+    void resetService(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+                     std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        (void)request;
+        
+        std::lock_guard<std::mutex> lock1(map_mutex_);
+        std::lock_guard<std::mutex> lock2(loop_mutex_);
+        
+        accumulated_map_->clear();
+        keyframes_.clear();
+        trajectory_.clear();
+        loop_constraints_.clear();
+        loop_detection_queue_.clear();
+        
+        current_pose_ = Eigen::Matrix4f::Identity();
+        map_initialized_ = false;
+        keyframe_counter_ = 0;
+        
+        response->success = true;
+        response->message = "SLAM system reset successfully";
+        RCLCPP_INFO(this->get_logger(), "SLAM system reset");
+    }
+    
+    void loopClosureService(const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+                           std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
+        loop_detection_enabled_ = request->data;
+        response->success = true;
+        response->message = loop_detection_enabled_ ? "Loop closure enabled" : "Loop closure disabled";
+        RCLCPP_INFO(this->get_logger(), "%s", response->message.c_str());
+    }
+
+    // 参数
+    std::string input_topic_;
+    std::string save_directory_;
+    double leaf_size_;
+    double icp_max_correspondence_distance_;
+    double icp_transformation_epsilon_;
+    double icp_euclidean_fitness_epsilon_;
+    int icp_max_iterations_;
+    double max_range_;
+    double min_range_;
+    
+    // SLAM参数
+    double keyframe_distance_threshold_;
+    double keyframe_angle_threshold_;
+    int max_map_size_;
+    double loop_closure_distance_threshold_;
+    double loop_closure_score_threshold_;
+    int pose_graph_optimization_interval_;
+    int trajectory_save_interval_;
+    
+    // ROS2接口
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr trajectory_pub_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_service_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_service_;
+    rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr loop_closure_service_;
+    
+    // 数据成员
+    std::mutex map_mutex_;
+    std::mutex loop_mutex_;
+    PointCloudT::Ptr accumulated_map_;
+    Eigen::Matrix4f current_pose_;
+    bool map_initialized_;
+    
+    // SLAM数据结构
+    std::vector<std::shared_ptr<KeyFrame>> keyframes_;
+    std::vector<TrajectoryPoint> trajectory_;
+    std::vector<std::shared_ptr<LoopConstraint>> loop_constraints_;
+    std::deque<std::shared_ptr<KeyFrame>> loop_detection_queue_;
+    
+    int keyframe_counter_;
+    std::atomic<bool> loop_detection_enabled_;
+    std::atomic<bool> pose_graph_optimization_enabled_;
+    std::atomic<bool> shutdown_requested_;
+    
+    // 后台线程
+    std::thread loop_detection_thread_;
+    std::thread pose_graph_thread_;
+};
+
+int main(int argc, char** argv) {
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<MappingNode>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
 }
